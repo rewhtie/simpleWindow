@@ -63,13 +63,10 @@ function getToken() {
   return null;
 }
 
-async function ensureToken() {
-  const existing = getToken();
-  if (existing) return existing;
-
-  console.log('\n未找到 GH_TOKEN、GITHUB_TOKEN 或 .release-token。');
+async function promptAndSaveToken(message) {
+  console.log(`\n${message}`);
   console.log('请创建能够向目标仓库写入 Release 的 GitHub Token。\n');
-  const token = (await ask('请输入 GitHub Token')).trim();
+  const token = (await ask('请输入新的 GitHub Token')).trim();
   if (!token) throw new Error('未提供 GitHub Token。');
 
   try {
@@ -79,6 +76,37 @@ async function ensureToken() {
     console.warn(`Token 保存失败，本次仍会继续：${error.message}`);
   }
   return token;
+}
+
+async function validateToken(token, owner, repo) {
+  return fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`,
+    { headers: authHeaders(token) },
+  );
+}
+
+async function ensureToken(owner, repo) {
+  let token = getToken();
+  let source = process.env.GH_TOKEN || process.env.GITHUB_TOKEN ? '环境变量' : '.release-token';
+
+  if (!token) {
+    token = await promptAndSaveToken('未找到 GH_TOKEN、GITHUB_TOKEN 或有效的 .release-token。');
+    source = '新输入';
+  }
+
+  while (true) {
+    const response = await validateToken(token, owner, repo);
+    if (response.ok) return token;
+
+    if (response.status !== 401) {
+      throw new Error(`验证 GitHub Token 失败：${await responseError(response)}`);
+    }
+
+    writeFileSync(TOKEN_FILE, '');
+    console.warn(`${source}中的 GitHub Token 无效或已过期，本地缓存已清空。`);
+    token = await promptAndSaveToken('请重新输入有效的 GitHub Token。');
+    source = '新输入';
+  }
 }
 
 function githubRemote() {

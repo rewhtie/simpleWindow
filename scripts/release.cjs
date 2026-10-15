@@ -26,10 +26,10 @@ const {
     console.log('已跳过上传。');
     return;
   }
-
+ 
   const remote = githubRemote();
+  const token = await ensureToken(remote.owner, remote.repo);
   const notes = await ask('发布说明', `${productName()} ${tag}`);
-  const token = await ensureToken();
 
   console.log(`\n==> 步骤 2/3：创建或查找 ${remote.owner}/${remote.repo} 的 ${tag}\n`);
   const release = await findOrCreateRelease(token, remote.owner, remote.repo, tag, notes);

@@ -18,8 +18,8 @@ const {
 
   const tag = releaseTag();
   const remote = githubRemote();
+  const token = await ensureToken(remote.owner, remote.repo);
   const notes = await ask('发布说明', `${productName()} ${tag}`);
-  const token = await ensureToken();
   const release = await findOrCreateRelease(token, remote.owner, remote.repo, tag, notes);
 
   await uploadFiles(token, release, files);

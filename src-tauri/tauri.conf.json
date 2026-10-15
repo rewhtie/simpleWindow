@@ -10,23 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "label": "orb",
-        "title": "Window 收纳",
-        "width": 76,
-        "height": 76,
-        "minWidth": 76,
-        "minHeight": 76,
-        "resizable": false,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "shadow": false,
-        "focus": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

@@ -181,10 +181,10 @@ onBeforeUnmount(() => unlisten?.())
       <div class="rule" />
 
       <button class="menu-item primary" type="button" @click="hideDesktop">
-        <span class="icon">●</span><span>立即隐藏</span>
+        <span class="icon">●</span><span>隐藏</span>
       </button>
       <button class="menu-item" type="button" @click="showDesktop">
-        <span class="icon">○</span><span>临时显示</span>
+        <span class="icon">○</span><span>显示</span>
       </button>
 
       <div class="rule" />

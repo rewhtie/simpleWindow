@@ -1,38 +1,49 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
     time::Duration,
 };
 
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
+use tauri::{
+    menu::{CheckMenuItemBuilder, MenuBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager,
+};
+use tauri_plugin_autostart::ManagerExt;
 use windows::{
     core::{w, BOOL},
     Win32::{
-        Foundation::{HWND, LPARAM},
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::SystemInformation::GetTickCount64,
         UI::{
-            Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+            Input::KeyboardAndMouse::{GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO},
             WindowsAndMessaging::{
-                EnumWindows, FindWindowExW, FindWindowW, ShowWindow, SW_HIDE, SW_SHOW,
+                CallNextHookEx, DispatchMessageW, EnumWindows, FindWindowExW, FindWindowW,
+                GetMessageW, SetWindowsHookExW, ShowWindow, TranslateMessage, MSG, SW_HIDE,
+                SW_SHOW, WH_MOUSE_LL, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
             },
         },
     },
 };
 
-struct DesktopState {
-    desktop_visible: AtomicBool,
-    menu_open: AtomicBool,
+
+static WHEEL_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && (wparam.0 as u32 == WM_MOUSEWHEEL || wparam.0 as u32 == WM_MOUSEHWHEEL) {
+        WHEEL_EVENT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    }
+    CallNextHookEx(None, code, wparam, lparam)
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UiState {
-    desktop_visible: bool,
+struct DesktopState {
+    desktop_visible: AtomicBool,
+    shutting_down: AtomicBool,
 }
+
 
 unsafe fn set_window_visible(window: HWND, visible: bool) {
     if !window.is_invalid() {
@@ -62,8 +73,7 @@ unsafe fn set_taskbars_visible(visible: bool) {
 unsafe extern "system" fn find_desktop_view(window: HWND, lparam: LPARAM) -> BOOL {
     if let Ok(view) = FindWindowExW(Some(window), None, w!("SHELLDLL_DefView"), None) {
         if !view.is_invalid() {
-            let target = lparam.0 as *mut HWND;
-            *target = view;
+            *(lparam.0 as *mut HWND) = view;
             return BOOL(0);
         }
     }
@@ -100,49 +110,14 @@ fn set_desktop_visible(state: &DesktopState, visible: bool) {
     state.desktop_visible.store(visible, Ordering::SeqCst);
 }
 
-fn emit_state(app: &AppHandle, state: &DesktopState) {
-    let _ = app.emit(
-        "desktop-state-changed",
-        UiState {
-            desktop_visible: state.desktop_visible.load(Ordering::SeqCst),
-        },
-    );
+fn toggle_desktop(state: &DesktopState) {
+    let visible = state.desktop_visible.load(Ordering::SeqCst);
+    set_desktop_visible(state, !visible);
 }
 
-#[tauri::command]
-fn hide_desktop(app: AppHandle, state: State<'_, Arc<DesktopState>>) {
-    set_desktop_visible(&state, false);
-    emit_state(&app, &state);
-}
-
-#[tauri::command]
-fn show_desktop_temporarily(app: AppHandle, state: State<'_, Arc<DesktopState>>) {
-    set_desktop_visible(&state, true);
-    emit_state(&app, &state);
-}
-
-#[tauri::command]
-fn set_menu_open(open: bool, state: State<'_, Arc<DesktopState>>) {
-    state.menu_open.store(open, Ordering::SeqCst);
-}
-
-#[tauri::command]
-fn get_desktop_state(state: State<'_, Arc<DesktopState>>) -> UiState {
-    UiState {
-        desktop_visible: state.desktop_visible.load(Ordering::SeqCst),
-    }
-}
-
-#[tauri::command]
-fn restart_app(app: AppHandle, state: State<'_, Arc<DesktopState>>) {
-    set_desktop_visible(&state, true);
-    app.restart();
-}
-
-#[tauri::command]
-fn quit_app(app: AppHandle, state: State<'_, Arc<DesktopState>>) {
-    set_desktop_visible(&state, true);
-    app.exit(0);
+fn restore_before_exit(state: &DesktopState) {
+    state.shutting_down.store(true, Ordering::SeqCst);
+    set_desktop_visible(state, true);
 }
 
 fn idle_milliseconds() -> u64 {
@@ -159,65 +134,147 @@ fn idle_milliseconds() -> u64 {
     }
 }
 
-fn start_idle_watcher(app: AppHandle, state: Arc<DesktopState>) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(250));
-        if state.desktop_visible.load(Ordering::SeqCst)
-            && !state.menu_open.load(Ordering::SeqCst)
-            && idle_milliseconds() >= 10_000
-        {
-            set_desktop_visible(&state, false);
-            emit_state(&app, &state);
+fn start_input_watcher(state: Arc<DesktopState>) {
+    thread::spawn(|| unsafe {
+        let Ok(_hook) = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0) else {
+            return;
+        };
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
     });
-}
 
-fn place_orb(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("orb") else {
-        return;
-    };
-    let Ok(Some(monitor)) = window.primary_monitor() else {
-        return;
-    };
-    let monitor_position = monitor.position();
-    let monitor_size = monitor.size();
-    let scale = monitor.scale_factor();
-    let orb_size = (76.0 * scale).round() as i32;
-    let margin = (18.0 * scale).round() as i32;
-    let x = monitor_position.x + monitor_size.width as i32 - orb_size - margin;
-    let y = monitor_position.y + (monitor_size.height as i32 - orb_size) / 2;
-    let _ = window.set_position(PhysicalPosition::new(x, y));
+    thread::spawn(move || {
+        let mut key_down = [false; 256];
+        let mut wheel_sequence = WHEEL_EVENT_SEQUENCE.load(Ordering::SeqCst);
+        let mut hidden_input_armed = false;
+
+        loop {
+            thread::sleep(Duration::from_millis(50));
+            if state.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let visible = state.desktop_visible.load(Ordering::SeqCst);
+            if visible {
+                hidden_input_armed = false;
+                if idle_milliseconds() >= 10_000 {
+                    set_desktop_visible(&state, false);
+                }
+                continue;
+            }
+
+            let current_wheel_sequence = WHEEL_EVENT_SEQUENCE.load(Ordering::SeqCst);
+            let wheel_changed = current_wheel_sequence != wheel_sequence;
+            wheel_sequence = current_wheel_sequence;
+
+            let mut pressed = false;
+            for virtual_key in 1..=255 {
+                let is_down = unsafe { GetAsyncKeyState(virtual_key) } < 0;
+                if hidden_input_armed && is_down && !key_down[virtual_key as usize] {
+                    pressed = true;
+                }
+                key_down[virtual_key as usize] = is_down;
+            }
+
+            if !hidden_input_armed {
+                hidden_input_armed = true;
+                continue;
+            }
+            if pressed || wheel_changed {
+                set_desktop_visible(&state, true);
+            }
+        }
+    });
 }
 
 pub fn run() {
     let state = Arc::new(DesktopState {
         desktop_visible: AtomicBool::new(false),
-        menu_open: AtomicBool::new(false),
+        shutting_down: AtomicBool::new(false),
     });
+    let setup_state = state.clone();
+    let run_state = state.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
-        .manage(state.clone())
-        .invoke_handler(tauri::generate_handler![
-            hide_desktop,
-            show_desktop_temporarily,
-            set_menu_open,
-            get_desktop_state,
-            restart_app,
-            quit_app
-        ])
+        .manage(state)
         .setup(move |app| {
-            set_desktop_visible(&state, false);
-            place_orb(app.handle());
-            start_idle_watcher(app.handle().clone(), state.clone());
+            set_desktop_visible(&setup_state, false);
+            start_input_watcher(setup_state.clone());
+
+            let autostart_enabled = app.autolaunch().is_enabled().unwrap_or(false);
+            let autostart = CheckMenuItemBuilder::with_id("autostart", "开机自启动")
+                .checked(autostart_enabled)
+                .build(app)?;
+            let menu = MenuBuilder::new(app)
+                .text("hide", "立即隐藏")
+                .text("show", "临时显示")
+                .separator()
+                .item(&autostart)
+                .text("restart", "重启应用")
+                .separator()
+                .text("quit", "退出应用")
+                .build()?;
+
+            let menu_state = setup_state.clone();
+            let autostart_item = autostart.clone();
+            let tray_state = setup_state.clone();
+            let icon = app
+                .default_window_icon()
+                .cloned()
+                .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
+
+            TrayIconBuilder::with_id("main")
+                .icon(icon)
+                .tooltip("Window 收纳")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(move |_tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Down,
+                        ..
+                    } = event
+                    {
+                        toggle_desktop(&tray_state);
+                    }
+                })
+                .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "hide" => set_desktop_visible(&menu_state, false),
+                    "show" => set_desktop_visible(&menu_state, true),
+                    "autostart" => {
+                        let manager = app.autolaunch();
+                        let enabled = manager.is_enabled().unwrap_or(false);
+                        let result = if enabled { manager.disable() } else { manager.enable() };
+                        if result.is_ok() {
+                            let _ = autostart_item.set_checked(!enabled);
+                        }
+                    }
+                    "restart" => {
+                        restore_before_exit(&menu_state);
+                        app.restart();
+                    }
+                    "quit" => {
+                        restore_before_exit(&menu_state);
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                let state = window.state::<Arc<DesktopState>>();
-                set_desktop_visible(&state, true);
+        .build(tauri::generate_context!())
+        .expect("failed to build Window 收纳")
+        .run(move |_app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                restore_before_exit(&run_state);
             }
-        })
-        .run(tauri::generate_context!())
-        .expect("failed to run Window 收纳");
+        });
 }
